@@ -1,0 +1,500 @@
+From 90f7315a379619876db2cbbd68b2f4f7fc82371b Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:25:44 +0800
+Subject: [PATCH] uos-fix-install-module-fail-by-restore-langext-file
+
+---
+ src/direct_api.c | 408 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/direct_api.h |   3 +
+ src/handle.c     |  10 ++
+ 3 files changed, 421 insertions(+)
+
+diff --git a/src/direct_api.c b/src/direct_api.c
+index 7aa081a..032add2 100644
+--- a/src/direct_api.c
++++ b/src/direct_api.c
+@@ -104,6 +104,11 @@ static int semanage_direct_install_info(semanage_handle_t *sh,
+ static int semanage_direct_remove_key(semanage_handle_t *sh,
+ 				      const semanage_module_key_t *modkey);
+ 
++static int semanage_direct_restore_module(semanage_handle_t * sh,
++					uint16_t priority,
++					const char *install_filename);
++
++
+ static struct semanage_policy_table direct_funcs = {
+ 	.get_serial = semanage_direct_get_serial,
+ 	.destroy = semanage_direct_destroy,
+@@ -123,6 +128,8 @@ static struct semanage_policy_table direct_funcs = {
+ 	.remove_key = semanage_direct_remove_key,
+ };
+ 
++static int check_and_restore_module_flag = 0;
++
+ int semanage_direct_is_managed(semanage_handle_t * sh)
+ {
+ 	if (semanage_check_init(sh, sh->conf->store_root_path))
+@@ -2172,6 +2179,8 @@ static int semanage_direct_get_module_info(semanage_handle_t *sh,
+ 	int ret = 0;
+ 
+ 	char fn[PATH_MAX];
++	char pp_path[PATH_MAX];
++	int check_flag = 0;
+ 	FILE *fp = NULL;
+ 	size_t size = 0;
+ 	struct stat sb;
+@@ -2267,6 +2276,7 @@ static int semanage_direct_get_module_info(semanage_handle_t *sh,
+ 		goto cleanup;
+ 	}
+ 
++check_lang_ext:
+ 	fp = fopen(fn, "r");
+ 
+ 	if (fp == NULL) {
+@@ -2279,6 +2289,17 @@ static int semanage_direct_get_module_info(semanage_handle_t *sh,
+ 
+ 	/* set module ext */
+ 	if (getline(&tmp, &size, fp) < 0) {
++		if (!check_flag && check_and_restore_module_flag) {
++			snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modkey->name);
++			if (access(pp_path, F_OK) == 0) {
++				fclose(fp);
++				fp = NULL;
++				semanage_direct_restore_module(sh, modkey->priority, pp_path);
++				check_flag = 1;
++				goto check_lang_ext;
++			}
++		}
++
+ 		ERR(sh,
+ 		    "Unable to read %s module lang ext file.",
+ 		    (*modinfo)->name);
+@@ -2966,3 +2987,390 @@ cleanup:
+ 	return status;
+ }
+ 
++static int semanage_direct_restore_info(semanage_handle_t *sh,
++					const semanage_module_info_t *modinfo,
++					char *data,
++					size_t data_len)
++{
++	assert(sh);
++	assert(modinfo);
++	assert(data);
++
++	int status = 0;
++	int ret = 0;
++	int type;
++	struct stat sb;
++
++	char path[PATH_MAX];
++	mode_t mask = umask(0077);
++
++	/* validate module info */
++	ret = semanage_module_info_validate(modinfo);
++	if (ret != 0) {
++		ERR(sh, "%s failed module validation.\n", modinfo->name);
++		status = -2;
++		goto cleanup;
++	}
++
++	/* write ext */
++	ret = semanage_direct_write_langext(sh, modinfo->lang_ext, modinfo);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	/* install module source file */
++	if (!strcasecmp(modinfo->lang_ext, "cil")) {
++		type = SEMANAGE_MODULE_PATH_CIL;
++	} else {
++		type = SEMANAGE_MODULE_PATH_HLL;
++	}
++	ret = semanage_module_get_path(
++			sh,
++			modinfo,
++			type,
++			path,
++			sizeof(path));
++	if (ret != 0) {
++		status = -3;
++		goto cleanup;
++	}
++
++	ret = bzip(sh, path, data, data_len);
++	if (ret <= 0) {
++		ERR(sh, "Error while writing to %s.", path);
++		status = -3;
++		goto cleanup;
++	}
++
++	/* if this is an HLL, delete the CIL cache if it exists so it will get recompiled */
++	if (type == SEMANAGE_MODULE_PATH_HLL) {
++		ret = semanage_module_get_path(
++				sh,
++				modinfo,
++				SEMANAGE_MODULE_PATH_CIL,
++				path,
++				sizeof(path));
++		if (ret != 0) {
++			status = -3;
++			goto cleanup;
++		}
++
++		if (stat(path, &sb) == 0) {
++			ret = unlink(path);
++			if (ret != 0) {
++				ERR(sh, "Error while removing cached CIL file %s: %s", path, strerror(errno));
++				status = -3;
++				goto cleanup;
++			}
++		}
++	}
++
++cleanup:
++	umask(mask);
++
++	return status;
++}
++
++/* Writes a module to the sandbox's module directory, overwriting any
++ * previous module stored within.  Note that module data are not
++ * free()d by this function; caller is responsible for deallocating it
++ * if necessary.  Returns 0 on success, -1 if out of memory, -2 if the
++ * data does not represent a valid module file, -3 if error while
++ * writing file. */
++static int semanage_direct_restore(semanage_handle_t * sh,
++				   char *data, size_t data_len, uint16_t priority,
++				   const char *module_name, const char *lang_ext)
++{
++	int status = 0;
++	int ret = 0;
++
++	semanage_module_info_t modinfo;
++	ret = semanage_module_info_init(sh, &modinfo);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	ret = semanage_module_info_set_priority(sh, &modinfo, priority);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	ret = semanage_module_info_set_name(sh, &modinfo, module_name);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	ret = semanage_module_info_set_lang_ext(sh, &modinfo, lang_ext);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	status = semanage_direct_restore_info(sh, &modinfo, data, data_len);
++
++cleanup:
++
++	semanage_module_info_destroy(sh, &modinfo);
++
++	return status;
++}
++
++static int semanage_direct_restore_module(semanage_handle_t * sh,
++					uint16_t priority,
++					const char *install_filename)
++{
++
++	int retval = -1;
++	char *data = NULL;
++	ssize_t data_len = 0;
++	int compressed = 0;
++	char *path = NULL;
++	char *filename;
++	char *lang_ext = NULL;
++	char *module_name = NULL;
++	char *separator;
++	char *version = NULL;
++
++	if ((data_len = map_file(sh, install_filename, &data, &compressed)) <= 0) {
++		ERR(sh, "Unable to read file %s\n", install_filename);
++		retval = -1;
++		goto cleanup;
++	}
++
++	path = strdup(install_filename);
++	if (path == NULL) {
++		ERR(sh, "No memory available for strdup.\n");
++		retval = -1;
++		goto cleanup;
++	}
++
++	filename = basename(path);
++
++	if (compressed) {
++		separator = strrchr(filename, '.');
++		if (separator == NULL) {
++			ERR(sh, "Compressed module does not have a valid extension.");
++			retval = -1;
++			goto cleanup;
++		}
++		*separator = '\0';
++		lang_ext = separator + 1;
++	}
++
++	separator = strrchr(filename, '.');
++	if (separator == NULL) {
++		if (lang_ext == NULL) {
++			ERR(sh, "Module does not have a valid extension.");
++			retval = -1;
++			goto cleanup;
++		}
++	} else {
++		*separator = '\0';
++		lang_ext = separator + 1;
++	}
++
++	if (strcmp(lang_ext, "pp") == 0) {
++		retval = parse_module_headers(sh, data, data_len, &module_name, &version);
++		free(version);
++		if (retval != 0)
++			goto cleanup;
++	}
++
++	if (module_name == NULL) {
++		module_name = strdup(filename);
++		if (module_name == NULL) {
++			ERR(sh, "No memory available for module_name.\n");
++			retval = -1;
++			goto cleanup;
++		}
++	} else if (strcmp(module_name, filename) != 0) {
++		fprintf(stderr, "Warning: SELinux userspace will refer to the module from %s as %s rather than %s\n", install_filename, module_name, filename);
++	}
++
++	retval = semanage_direct_restore(sh, data, data_len, priority, module_name, lang_ext);
++
++cleanup:
++	if (data_len > 0) munmap(data, data_len);
++	free(module_name);
++	free(path);
++
++	return retval;
++}
++
++int semanage_direct_check_and_restore_all_modules(semanage_handle_t *sh)
++{
++	assert(sh);
++
++	int status = 0;
++	int ret = 0;
++
++	int i = 0;
++	int j = 0;
++
++	const char *toplevel = NULL;
++
++	struct dirent **priorities = NULL;
++	int priorities_len = 0;
++	char priority_path[PATH_MAX];
++	char pp_path[PATH_MAX];
++
++	struct dirent **modules = NULL;
++	int modules_len = 0;
++
++	uint16_t priority = 0;
++
++	semanage_module_info_t *modinfo_tmp = NULL;
++
++	semanage_module_info_t modinfo;
++	ret = semanage_module_info_init(sh, &modinfo);
++	if (ret != 0) {
++		status = -1;
++		goto cleanup;
++	}
++
++	if (sh->is_in_transaction) {
++		toplevel = semanage_path(SEMANAGE_TMP, SEMANAGE_MODULES);
++	} else {
++		toplevel = semanage_path(SEMANAGE_ACTIVE, SEMANAGE_MODULES);
++	}
++
++	/* find priorities */
++	priorities_len = scandir(toplevel,
++				 &priorities,
++				 semanage_priorities_filename_select,
++				 versionsort);
++	if (priorities_len == -1) {
++		ERR(sh, "Error while scanning directory %s.", toplevel);
++		status = -1;
++		goto cleanup;
++	}
++
++	/* for each priority directory */
++	/* loop through in reverse so that highest priority is first */
++	for (i = priorities_len - 1; i >= 0; i--) {
++		/* convert priority string to uint16_t */
++		ret = semanage_string_to_priority(priorities[i]->d_name,
++						  &priority);
++		if (ret != 0) {
++			status = -1;
++			goto cleanup;
++		}
++
++		/* set our priority */
++		ret = semanage_module_info_set_priority(sh,
++							&modinfo,
++							priority);
++		if (ret != 0) {
++			status = -1;
++			goto cleanup;
++		}
++
++		/* get the priority path */
++		ret = semanage_module_get_path(sh,
++					       &modinfo,
++					       SEMANAGE_MODULE_PATH_PRIORITY,
++					       priority_path,
++					       sizeof(priority_path));
++		if (ret != 0) {
++			status = -1;
++			goto cleanup;
++		}
++
++		/* cleanup old modules */
++		if (modules != NULL) {
++			for (j = 0; j < modules_len; j++) {
++				free(modules[j]);
++				modules[j] = NULL;
++			}
++			free(modules);
++			modules = NULL;
++			modules_len = 0;
++		}
++
++		/* find modules at this priority */
++		modules_len = scandir(priority_path,
++				      &modules,
++				      semanage_modules_filename_select,
++				      versionsort);
++		if (modules_len == -1) {
++			ERR(sh,
++			    "Error while scanning directory %s.",
++			    priority_path);
++			status = -1;
++			goto cleanup;
++		}
++
++		if (modules_len == 0) continue;
++
++		/* for each module directory */
++		for(j = 0; j < modules_len; j++) {
++			/* set module name */
++			ret = semanage_module_info_set_name(
++					sh,
++					&modinfo,
++					modules[j]->d_name);
++			if (ret != 0) {
++				status = -1;
++				goto cleanup;
++			}
++
++			/* get module values, if fail, then try to restore it. */
++			ret = semanage_direct_get_module_info(
++					sh,
++					(const semanage_module_key_t *)
++						(&modinfo),
++					&modinfo_tmp);
++			if (ret != 0) {
++				snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modules[j]->d_name);
++				if (access(pp_path, F_OK) == 0)
++					semanage_direct_restore_module(sh, priority, pp_path);
++			}
++
++			semanage_module_info_destroy(sh, modinfo_tmp);
++			free(modinfo_tmp);
++			modinfo_tmp = NULL;
++		}
++	}
++
++cleanup:
++	semanage_module_info_destroy(sh, &modinfo);
++
++	if (priorities != NULL) {
++		for (i = 0; i < priorities_len; i++) {
++			free(priorities[i]);
++		}
++		free(priorities);
++	}
++
++	if (modules != NULL) {
++		for (i = 0; i < modules_len; i++) {
++			free(modules[i]);
++		}
++		free(modules);
++	}
++
++	semanage_module_info_destroy(sh, modinfo_tmp);
++	free(modinfo_tmp);
++	modinfo_tmp = NULL;
++
++	return status;
++}
++
++int semanage_direct_set_restore_module_flag(semanage_handle_t *sh, int enabled)
++ {
++	/* Only security privileged processes(who is allowed to write selinux config file) can enable this flag */
++	if (enabled) {
++		int fd = open("/etc/selinux/config", O_WRONLY);
++		if (fd < 0)
++			return -1;
++		close(fd);
++	}
++	check_and_restore_module_flag = enabled > 0 ? 1 : 0;
++	return 0;
++ }
++
++
+diff --git a/src/direct_api.h b/src/direct_api.h
+index ffd428e..37fd33c 100644
+--- a/src/direct_api.h
++++ b/src/direct_api.h
+@@ -39,4 +39,7 @@ int semanage_direct_access_check(struct semanage_handle *sh);
+ 
+ int semanage_direct_mls_enabled(struct semanage_handle *sh);
+ 
++int semanage_direct_check_and_restore_all_modules(struct semanage_handle *sh);
++int semanage_direct_set_restore_module_flag(struct semanage_handle *sh, int enabled);
++
+ #endif
+diff --git a/src/handle.c b/src/handle.c
+index 461f475..c1be279 100644
+--- a/src/handle.c
++++ b/src/handle.c
+@@ -258,8 +258,18 @@ uint16_t semanage_get_default_priority(semanage_handle_t *sh)
+ 
+ int semanage_set_default_priority(semanage_handle_t *sh, uint16_t priority)
+ {
++#define RESTORE_MODULE_FLAG 0x8000
++#define RESTORE_MODULE_MASK 0x7fff
++	int restore_flag = priority & RESTORE_MODULE_FLAG;
++
+ 	assert(sh != NULL);
+ 
++	if (restore_flag) {
++		priority = priority & RESTORE_MODULE_MASK;
++		semanage_direct_set_restore_module_flag(sh,1);
++	} else
++		semanage_direct_set_restore_module_flag(sh,0);
++
+ 	/* Verify priority */
+ 	if (semanage_module_validate_priority(priority) < 0) {
+ 		ERR(sh, "Priority %d is invalid.", priority);
+-- 
+2.20.1
+

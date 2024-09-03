@@ -1,0 +1,29 @@
+From bd7f1a48dba8c4f5c07ebd1ead1489ca86c0d955 Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:31:03 +0800
+Subject: [PATCH] uos-optimize-module-disable-warning
+
+---
+ src/direct_api.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/direct_api.c b/src/direct_api.c
+index b2bdd37..0e00d97 100644
+--- a/src/direct_api.c
++++ b/src/direct_api.c
+@@ -2807,9 +2807,9 @@ static int semanage_direct_install_info(semanage_handle_t *sh,
+ 
+ 		if (higher_info->enabled == 0 && modinfo->enabled == -1) {
+ 			errno = 0;
+-			WARN(sh,
+-			     "%s module will be disabled after install as there is a disabled instance of this module present in the system.",
+-			     modinfo->name);
++			//WARN(sh,
++			//     "%s module will be disabled after install as there is a disabled instance of this module present in the system.",
++			//     modinfo->name);
+ 		}
+ 	}
+ 
+-- 
+2.20.1
+

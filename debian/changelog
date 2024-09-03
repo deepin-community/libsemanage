@@ -1,3 +1,18 @@
+libsemanage (3.6-1) unstable; urgency=medium
+
+  [merge security patches] 
+  * fix：fILE stream shells is not closed before return in get_shell_list()
+  * fix genhomedircon to fit uos udcp
+  * fix: 修复下发sebool以及安装、获取策略模块失败的bug，采用规避方案，失败时设置自动恢复flag，然后再调用一次来恢复
+  * feat：适配sid2解耦方案
+  * feat:新增接口 semanage_check_and_restore_all_modules 用来直接恢复/var/lib/selinux/default/active/module/*/lang_ext文件被破坏导致semodule加载策略失败的场景
+  * feat: 新增接口 semanage_set_restore_module_flag，用来设置恢复标志位，这样在semanage_direct_get_module_info接口中会根据标志位来自动修复入参指定的模块的损坏的lang_ext文件
+  * feat: 修改semanage_set_default_priority接口，当入参priority带有0x8000标志位时，调用semanage_set_restore_module_flag接口设置自动修复标志位
+  * feat: 在semanage_direct_get_module_info接口的恢复lang_ext的流程中新增打印，便于调试
+  * feat: 优化semanage_direct_install_info接口中对与disable module的warning打印
+
+ -- Xiaojun Yu <yuxiaojun@uniontech.com>  Wed, 03 Sep 2024 13:20:11 +0200
+
 libsemanage (3.5-1deepin1) unstable; urgency=medium
 
   * No source change upload against python 3.12.

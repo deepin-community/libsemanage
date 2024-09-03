@@ -1,0 +1,42 @@
+Description: Look for the hll compiler in /usr/lib instead of /usr/libexec
+Author: Laurent Bigonville <bigon@debian.org>
+Forwarded: not-needed
+From 2e4dc96b1441416701992462881b775d3e7e0a1a Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 10:56:15 +0800
+Subject: [PATCH] libexec-path
+
+---
+ man/man5/semanage.conf.5 | 2 +-
+ src/conf-parse.y         | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/man/man5/semanage.conf.5 b/man/man5/semanage.conf.5
+index 380b58b..90a7b65 100644
+--- a/man/man5/semanage.conf.5
++++ b/man/man5/semanage.conf.5
+@@ -37,7 +37,7 @@ Specify an alternative store_root path to use. The default is "/var/lib/selinux"
+ 
+ .TP
+ .B compiler-directory
+-Specify an alternative directory that contains HLL to CIL compilers. The default value is "/usr/libexec/selinux/hll".
++Specify an alternative directory that contains HLL to CIL compilers. The default value is "/usr/lib/selinux/hll".
+ 
+ .TP
+ .B ignore-module-cache
+diff --git a/src/conf-parse.y b/src/conf-parse.y
+index eac9134..cd830f5 100644
+--- a/src/conf-parse.y
++++ b/src/conf-parse.y
+@@ -353,7 +353,7 @@ static int semanage_conf_init(semanage_conf_t * conf)
+ 	conf->store_path = strdup(basename(selinux_policy_root()));
+ 	conf->ignoredirs = NULL;
+ 	conf->store_root_path = strdup("/var/lib/selinux");
+-	conf->compiler_directory_path = strdup("/usr/libexec/selinux/hll");
++	conf->compiler_directory_path = strdup("/usr/lib/selinux/hll");
+ 	conf->policyvers = sepol_policy_kern_vers_max();
+ 	conf->target_platform = SEPOL_TARGET_SELINUX;
+ 	conf->expand_check = 1;
+-- 
+2.20.1
+

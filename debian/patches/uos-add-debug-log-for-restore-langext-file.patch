@@ -1,0 +1,26 @@
+From 331df712d3ad4d04add4f2056eca65744880e1af Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:27:32 +0800
+Subject: [PATCH] uos-add-debug-log-for-restore-langext-file
+
+---
+ src/direct_api.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/direct_api.c b/src/direct_api.c
+index 032add2..b2bdd37 100644
+--- a/src/direct_api.c
++++ b/src/direct_api.c
+@@ -2303,6 +2303,9 @@ check_lang_ext:
+ 		ERR(sh,
+ 		    "Unable to read %s module lang ext file.",
+ 		    (*modinfo)->name);
++		ERR(sh,
++		    "check_flag:%d, check_and_restore_module_flag:%d.",
++		    check_flag, check_and_restore_module_flag);
+ 		status = -1;
+ 		goto cleanup;
+ 	}
+-- 
+2.20.1
+

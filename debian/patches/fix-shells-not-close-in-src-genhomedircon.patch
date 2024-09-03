@@ -1,0 +1,32 @@
+From c6d6faf574659ab7c5c8d8ec4cbd57ad50ff34f0 Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:07:52 +0800
+Subject: [PATCH] 0002-fix-shells-not-close-in-src-genhomedircon
+
+---
+ src/genhomedircon.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/genhomedircon.c b/src/genhomedircon.c
+index 8f8774d..f139e37 100644
+--- a/src/genhomedircon.c
++++ b/src/genhomedircon.c
+@@ -226,13 +226,14 @@ static semanage_list_t *get_shell_list(void)
+ 		if (strcmp(temp, PATH_NOLOGIN_SHELL)) {
+ 			if (semanage_list_push(&list, temp)) {
+ 				free(temp);
++				fclose(shells);
+ 				semanage_list_destroy(&list);
+ 				return default_shell_list();
+ 			}
+ 		}
+ 	}
+ 	free(temp);
+-
++	fclose(shells);
+ 	return list;
+ }
+ 
+-- 
+2.20.1
+

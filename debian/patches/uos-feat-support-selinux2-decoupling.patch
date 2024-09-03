@@ -1,0 +1,30 @@
+From 0ce75421f4c24c7835c859ff622d66445655b119 Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:12:24 +0800
+Subject: [PATCH] uos-feat-support-selinux2-decoupling
+
+---
+ src/handle.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/handle.c b/src/handle.c
+index b2201ee..461f475 100644
+--- a/src/handle.c
++++ b/src/handle.c
+@@ -88,8 +88,11 @@ semanage_handle_t *semanage_handle_create(void)
+ 
+ 	sh->commit_err = 0;
+ 
+-	/* By default always reload policy after commit if SELinux is enabled. */
+-	sh->do_reload = (is_selinux_enabled() > 0);
++	/* By default always reload policy after commit if SELinux is enabled.
++	 * if only selinux2 is enabled, selinux_mnt is not NULL but is_selinux_enabled
++	 * will return 0, so use security_getenforce() here is the best way.
++	*/
++	sh->do_reload = (security_getenforce() >= 0);
+ 
+ 	/* By default always check the file contexts file. */
+ 	sh->do_check_contexts = 1;
+-- 
+2.20.1
+
