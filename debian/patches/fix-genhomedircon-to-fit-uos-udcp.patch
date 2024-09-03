@@ -1,0 +1,25 @@
+From 4c159da1a25de091e49972e9aa3ba6a8aadcad25 Mon Sep 17 00:00:00 2001
+From: yuxiaojun <yuxiaojun@uniontech.com>
+Date: Tue, 3 Sep 2024 11:10:14 +0800
+Subject: [PATCH] fix-genhomedircon-to-fit-uos-udcp
+
+---
+ src/genhomedircon.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/genhomedircon.c b/src/genhomedircon.c
+index f139e37..59a4b99 100644
+--- a/src/genhomedircon.c
++++ b/src/genhomedircon.c
+@@ -1008,7 +1008,7 @@ static int add_user(genhomedircon_settings_t * s,
+ 
+ 	retval = getpwnam_r(name, &pwstorage, rbuf, rbuflen, &pwent);
+ 	if (retval != 0 || pwent == NULL) {
+-		if (retval != 0 && retval != ENOENT) {
++		if (retval != 0 && retval != ENOENT && retval != ENETUNREACH) {
+ 			goto cleanup;
+ 		}
+ 
+-- 
+2.20.1
+
