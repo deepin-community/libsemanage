@@ -1,4 +1,4 @@
-libsemanage (3.6-1) unstable; urgency=medium
+libsemanage (3.5-1deepin2) unstable; urgency=medium
 
   [merge security patches] 
   * fix：fILE stream shells is not closed before return in get_shell_list()
