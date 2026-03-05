@@ -7,5 +7,4 @@ uos-feat-support-selinux2-decoupling.patch
 uos-fix-install-module-fail-by-restore-langext-file.patch
 uos-add-debug-log-for-restore-langext-file.patch
 uos-optimize-module-disable-warning.patch
-
-
+uos-add-security-compatibility-layer.patch

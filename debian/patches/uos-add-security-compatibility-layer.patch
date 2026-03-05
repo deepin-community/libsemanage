@@ -1,0 +1,1616 @@
+From 5610ac56a612920d8f0cc757e69b3ba4ded42e5a Mon Sep 17 00:00:00 2001
+From: zhouzilong <zhouzilong@uniontech.com>
+Date: Thu, 5 Mar 2026 15:24:56 +0800
+Subject: [PATCH] Add security compatibility layer to compatibility with
+ SELinux and USEC
+
+---
+ include/semanage/handle.h        |  10 ++
+ include/semanage/seuser_record.h |   2 +-
+ src/Makefile                     |  10 +-
+ src/boolean_record.c             |  14 +-
+ src/booleans_activedb.c          | 103 ++++++++++++++-
+ src/conf-parse.y                 |  51 +++++---
+ src/direct_api.c                 |  31 +++--
+ src/handle.c                     |  24 +++-
+ src/handle.h                     |   1 +
+ src/libsemanage.map              |   1 +
+ src/security_compat.c            | 212 +++++++++++++++++++++++++++++++
+ src/security_compat.h            |  36 ++++++
+ src/semanage-usec.conf           |  46 +++++++
+ src/semanage_conf.h              |   2 +-
+ src/semanage_store.c             |  44 ++++---
+ src/semanage_store.h             |   2 +-
+ src/semanageswig_python.i        |  64 +++++-----
+ src/semanageswig_ruby.i          |  32 ++---
+ src/seuser_record.c              |   4 +-
+ src/seusers_local.c              |   8 +-
+ tests/Makefile                   |  10 +-
+ 21 files changed, 588 insertions(+), 119 deletions(-)
+ create mode 100644 src/security_compat.c
+ create mode 100644 src/security_compat.h
+ create mode 100644 src/semanage-usec.conf
+
+diff --git a/include/semanage/handle.h b/include/semanage/handle.h
+index 4cf3081..b41cd39 100644
+--- a/include/semanage/handle.h
++++ b/include/semanage/handle.h
+@@ -30,10 +30,20 @@
+ struct semanage_handle;
+ typedef struct semanage_handle semanage_handle_t;
+ 
++/* Select which security backend libsemanage should use. */
++enum semanage_security_backend {
++	SEMANAGE_SECURITY_BACKEND_SELINUX = 0,
++	SEMANAGE_SECURITY_BACKEND_USEC = 1
++};
++
+ /* Create and return a semanage handle.
+    The handle is initially in the disconnected state. */
+ extern semanage_handle_t *semanage_handle_create(void);
+ 
++/* Create a semanage handle and select a security backend.
++ * Returns NULL if the backend is not supported by this build. */
++extern semanage_handle_t *semanage_handle_create_with_security_backend(enum semanage_security_backend backend);
++
+ /* Deallocate all space associated with a semanage_handle_t, including
+  * the pointer itself.	CAUTION: this function does not disconnect
+  * from the backend; be sure that a semanage_disconnect() was
+diff --git a/include/semanage/seuser_record.h b/include/semanage/seuser_record.h
+index bf0dc8e..5d18d52 100644
+--- a/include/semanage/seuser_record.h
++++ b/include/semanage/seuser_record.h
+@@ -34,7 +34,7 @@ extern int semanage_seuser_set_name(semanage_handle_t * handle,
+ 				    semanage_seuser_t * seuser,
+ 				    const char *name);
+ 
+-/* Selinux Name */
++/* Security Name */
+ extern const char *semanage_seuser_get_sename(const semanage_seuser_t * seuser);
+ 
+ extern int semanage_seuser_set_sename(semanage_handle_t * handle,
+diff --git a/src/Makefile b/src/Makefile
+index 589e4a7..af621ac 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -21,6 +21,7 @@ RUBYLIBS ?= $(shell $(RUBY) -e 'puts "-L" + RbConfig::CONFIG["libdir"] + " -L" +
+ RUBYINSTALL ?= $(shell $(RUBY) -e 'puts RbConfig::CONFIG["vendorarchdir"]')
+ 
+ DEFAULT_SEMANAGE_CONF_LOCATION=$(SYSCONFDIR)/selinux/semanage.conf
++USEC_SEMANAGE_CONF_LOCATION=$(SYSCONFDIR)/usec/semanage.conf
+ 
+ ifeq ($(DEBUG),1)
+ 	export CFLAGS ?= -g3 -O0 -gdwarf-2 -fno-strict-aliasing -Wall -Wshadow -Werror
+@@ -61,6 +62,12 @@ SWIG_CFLAGS += -Wno-error -Wno-unused-but-set-variable -Wno-unused-variable -Wno
+ 		-Wno-unused-parameter -Wno-missing-prototypes
+ 
+ override CFLAGS += -I../include -D_GNU_SOURCE
++
++ifeq ($(USEC),1)
++	override CFLAGS += -DHAVE_USEC=1
++	USEC_LIBS = -lusec
++endif
++
+ RANLIB ?= ranlib
+ 
+ SWIG = swig -Wall -python -o $(SWIGCOUT) -outdir ./
+@@ -90,7 +97,7 @@ $(LIBA): $(OBJS)
+ 	$(RANLIB) $@
+ 
+ $(LIBSO): $(LOBJS)
+-	$(CC) $(CFLAGS) $(LDFLAGS) -shared -o $@ $^ -lsepol -laudit -lselinux -lbz2 -Wl,-soname,$(LIBSO),--version-script=libsemanage.map,-z,defs
++	$(CC) $(CFLAGS) $(LDFLAGS) -shared -o $@ $^ -lsepol -laudit -lselinux $(USEC_LIBS) -lbz2 -Wl,-soname,$(LIBSO),--version-script=libsemanage.map,-z,defs
+ 	ln -sf $@ $(TARGET)
+ 
+ $(LIBPC): $(LIBPC).in ../VERSION
+@@ -141,6 +148,7 @@ install: all
+ 	test -d $(DESTDIR)$(LIBDIR)/pkgconfig || install -m 755 -d $(DESTDIR)$(LIBDIR)/pkgconfig
+ 	install -m 644 $(LIBPC) $(DESTDIR)$(LIBDIR)/pkgconfig
+ 	test -f $(DESTDIR)$(DEFAULT_SEMANAGE_CONF_LOCATION) || install -m 644 -D semanage.conf $(DESTDIR)$(DEFAULT_SEMANAGE_CONF_LOCATION)
++	test -f $(DESTDIR)$(USEC_SEMANAGE_CONF_LOCATION) || install -m 644 -D semanage-usec.conf $(DESTDIR)$(USEC_SEMANAGE_CONF_LOCATION)
+ 	cd $(DESTDIR)$(LIBDIR) && ln -sf $(LIBSO) $(TARGET)
+ 
+ install-pywrap: pywrap 
+diff --git a/src/boolean_record.c b/src/boolean_record.c
+index 40dc654..685e0fe 100644
+--- a/src/boolean_record.c
++++ b/src/boolean_record.c
+@@ -23,7 +23,7 @@ typedef semanage_bool_key_t record_key_t;
+ #include "boolean_internal.h"
+ #include "handle.h"
+ #include "database.h"
+-#include <selinux/selinux.h>
++#include "security_compat.h"
+ 
+ /* Key */
+ int semanage_bool_key_create(semanage_handle_t * handle,
+@@ -85,17 +85,17 @@ int semanage_bool_set_name(semanage_handle_t * handle,
+ 	int rc = -1;
+ 	const char *prefix = semanage_root();
+ 	const char *storename = handle->conf->store_path;
+-	const char *selinux_root = selinux_policy_root();
++	const char *secuirty_root = semanage_compat_security_policy_root(handle);
+ 	char *oldroot;
+ 	char *olddir;
+ 	char *subname = NULL;
+ 	char *newroot = NULL;
+ 	char *end;
+ 
+-	if (!selinux_root)
++	if (!secuirty_root)
+ 		return -1;
+ 
+-	oldroot = strdup(selinux_root);
++	oldroot = strdup(secuirty_root);
+ 	if (!oldroot)
+ 		return -1;
+ 	olddir = strdup(oldroot);
+@@ -111,19 +111,19 @@ int semanage_bool_set_name(semanage_handle_t * handle,
+ 		goto out;
+ 
+ 	if (strcmp(oldroot, newroot)) {
+-		rc = selinux_set_policy_root(newroot);
++		rc = semanage_compat_security_set_policy_root(handle, newroot);
+ 		if (rc)
+ 			goto out;
+ 	}
+ 
+-	subname = selinux_boolean_sub(name);
++	subname = semanage_compat_security_boolean_sub(handle, name);
+ 	if (!subname) {
+ 		rc = -1;
+ 		goto out;
+ 	}
+ 
+ 	if (strcmp(oldroot, newroot)) {
+-		rc = selinux_set_policy_root(oldroot);
++		rc = semanage_compat_security_set_policy_root(handle, oldroot);
+ 		if (rc)
+ 			goto out;
+ 	}
+diff --git a/src/booleans_activedb.c b/src/booleans_activedb.c
+index 9bcc9d7..ab9d011 100644
+--- a/src/booleans_activedb.c
++++ b/src/booleans_activedb.c
+@@ -12,12 +12,12 @@ typedef struct dbase_activedb dbase_t;
+ 
+ #include <stdlib.h>
+ #include <string.h>
+-#include <selinux/selinux.h>
+ #include <semanage/handle.h>
+ #include "boolean_internal.h"
+ #include "database_activedb.h"
+ #include "parse_utils.h"
+ #include "debug.h"
++#include "security_compat.h"
+ 
+ static int bool_read_list(semanage_handle_t * handle,
+ 			  semanage_bool_t *** booleans, unsigned int *count)
+@@ -31,7 +31,7 @@ static int bool_read_list(semanage_handle_t * handle,
+ 	int len = 0;
+ 
+ 	/* Fetch boolean names */
+-	if (security_get_boolean_names(&names, &len) < 0) {
++	if (semanage_compat_security_get_boolean_names(handle, &names, &len) < 0) {
+ 		ERR(handle, "could not get list of boolean names");
+ 		goto err;
+ 	}
+@@ -54,7 +54,7 @@ static int bool_read_list(semanage_handle_t * handle,
+ 					   tmp_booleans[i], names[i]) < 0)
+ 			goto err;
+ 
+-		value = security_get_boolean_active(names[i]);
++		value = semanage_compat_security_get_boolean_active(handle, names[i]);
+ 		if (value < 0) {
+ 			ERR(handle, "could not get the value "
+ 			    "for boolean %s", names[i]);
+@@ -87,6 +87,96 @@ static int bool_read_list(semanage_handle_t * handle,
+ 	return STATUS_ERR;
+ }
+ 
++
++#ifdef HAVE_USEC
++static int bool_commit_list(semanage_handle_t * handle,
++			    semanage_bool_t ** booleans, unsigned int count)
++{
++
++	void *target_blist = NULL;
++    const char *name;
++    unsigned int bcount = 0;
++    unsigned int i;
++    int curvalue, newvalue;
++    int use_USEC_backend = (semanage_compat_get_backend(handle) == SEMANAGE_SECURITY_BACKEND_USEC);
++
++    /* Allocate a sufficiently large array */
++    if (use_USEC_backend) {
++        target_blist = malloc(sizeof(usec_boolean_t) * count);
++    } else {
++        target_blist = malloc(sizeof(SELboolean) * count);
++    }
++    
++    if (target_blist == NULL)
++        goto omem;
++
++    /* Populate array */
++    for (i = 0; i < count; i++) {
++        name = semanage_bool_get_name(booleans[i]);
++        if (!name)
++            goto omem;   
++        newvalue = semanage_bool_get_value(booleans[i]);
++        curvalue = semanage_compat_security_get_boolean_active(handle, name);
++        if (newvalue == curvalue)
++            continue;
++        
++        if (use_USEC_backend) {
++            usec_boolean_t *usecblist = (usec_boolean_t *)target_blist;
++            usecblist[bcount].name = strdup(name);
++            if (usecblist[bcount].name == NULL)
++                goto omem;
++            usecblist[bcount].value = newvalue;
++        } else {
++            SELboolean *seblist = (SELboolean *)target_blist;
++            seblist[bcount].name = strdup(name);
++            if (seblist[bcount].name == NULL)
++                goto omem;
++            seblist[bcount].value = newvalue;
++        }
++        bcount++;
++    }
++    
++    /* Commit */
++    if (semanage_compat_security_set_boolean_list(handle, bcount, target_blist, 0) < 0) {
++        ERR(handle, "security backend commit failed");
++        goto err;
++    }
++
++    for (i = 0; i < bcount; i++) {
++        // 根据 backend 类型选择正确的结构体访问方式
++        if (use_USEC_backend) {
++            usec_boolean_t *usecblist = (usec_boolean_t *)target_blist;
++            free(usecblist[i].name);
++        } else {
++            SELboolean *seblist = (SELboolean *)target_blist;
++            free(seblist[i].name);
++        }
++    }
++    free(target_blist);
++    target_blist = NULL;
++    return STATUS_SUCCESS;
++
++  omem:
++    ERR(handle, "out of memory");
++
++  err:
++    ERR(handle, "could not commit boolean list");
++    if (target_blist) {
++        for (i = 0; i < bcount; i++) {
++            if (use_USEC_backend) {
++                usec_boolean_t *usecblist = (usec_boolean_t *)target_blist;
++                free(usecblist[i].name);
++            } else {
++                SELboolean *seblist = (SELboolean *)target_blist;
++                free(seblist[i].name);
++            }
++        }
++        free(target_blist);
++    }
++    return STATUS_ERR;
++}
++
++#else
+ static int bool_commit_list(semanage_handle_t * handle,
+ 			    semanage_bool_t ** booleans, unsigned int count)
+ {
+@@ -108,7 +198,7 @@ static int bool_commit_list(semanage_handle_t * handle,
+ 		if (!name)
+ 			goto omem;	
+ 		newvalue = semanage_bool_get_value(booleans[i]);
+-		curvalue = security_get_boolean_active(name);
++		curvalue = semanage_compat_security_get_boolean_active(handle, name);
+ 		if (newvalue == curvalue)
+ 			continue;
+ 		blist[bcount].name = strdup(name);
+@@ -119,8 +209,8 @@ static int bool_commit_list(semanage_handle_t * handle,
+ 	}
+ 
+ 	/* Commit */
+-	if (security_set_boolean_list(bcount, blist, 0) < 0) {
+-		ERR(handle, "libselinux commit failed");
++	if (semanage_compat_security_set_boolean_list(handle, bcount, blist, 0) < 0) {
++		ERR(handle, "security backend commit failed");
+ 		goto err;
+ 	}
+ 
+@@ -139,6 +229,7 @@ static int bool_commit_list(semanage_handle_t * handle,
+ 	free(blist);
+ 	return STATUS_ERR;
+ }
++#endif
+ 
+ /* BOOL RECORD: ACTIVEDB extension: method table */
+ record_activedb_table_t SEMANAGE_BOOL_ACTIVEDB_RTABLE = {
+diff --git a/src/conf-parse.y b/src/conf-parse.y
+index eac9134..a987639 100644
+--- a/src/conf-parse.y
++++ b/src/conf-parse.y
+@@ -23,7 +23,6 @@
+ #include "semanage_conf.h"
+ 
+ #include <sepol/policydb.h>
+-#include <selinux/selinux.h>
+ #include <semanage/handle.h>
+ 
+ #include <unistd.h>
+@@ -31,6 +30,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "security_compat.h"
++
+ extern int semanage_lex(void);                /* defined in conf-scan.c */
+ extern int semanage_lex_destroy(void);        /* defined in conf-scan.c */
+ int semanage_error(const char *msg);
+@@ -46,6 +47,7 @@ static int new_external_prog(external_prog_t **chain);
+ 
+ static semanage_conf_t *current_conf;
+ static external_prog_t *new_external;
++static semanage_handle_t *current_handle;
+ static int parse_errors;
+ 
+ #define PASSIGN(p1,p2) { free(p1); p1 = p2; }
+@@ -349,11 +351,23 @@ external_opt:   PROG_PATH '=' ARG  { PASSIGN(new_external->path, $3); }
+ 
+ static int semanage_conf_init(semanage_conf_t * conf)
+ {
++	const char *prog_prefix = "";
++	char path[128];
++	
+ 	conf->store_type = SEMANAGE_CON_DIRECT;
+-	conf->store_path = strdup(basename(selinux_policy_root()));
++	conf->store_path = strdup(basename(semanage_compat_security_policy_root(current_handle)));
+ 	conf->ignoredirs = NULL;
+-	conf->store_root_path = strdup("/var/lib/selinux");
+-	conf->compiler_directory_path = strdup("/usr/libexec/selinux/hll");
++	
++	/* Set default paths based on security backend */
++	if (semanage_compat_get_backend(current_handle) == SEMANAGE_SECURITY_BACKEND_USEC) {
++		prog_prefix = "usec_";
++		conf->store_root_path = strdup("/var/lib/usec");
++		conf->compiler_directory_path = strdup("/usr/libexec/usec/hll");
++	} else {
++		conf->store_root_path = strdup("/var/lib/selinux");
++		conf->compiler_directory_path = strdup("/usr/libexec/selinux/hll");
++	}
++	
+ 	conf->policyvers = sepol_policy_kern_vers_max();
+ 	conf->target_platform = SEPOL_TARGET_SELINUX;
+ 	conf->expand_check = 1;
+@@ -374,10 +388,12 @@ static int semanage_conf_init(semanage_conf_t * conf)
+ 		return -1;
+ 	}
+ 
+-	if (access("/sbin/load_policy", X_OK) == 0) {
+-		conf->load_policy->path = strdup("/sbin/load_policy");
++	snprintf(path, sizeof(path), "/sbin/%sload_policy", prog_prefix);
++	if (access(path, X_OK) == 0) {
++		conf->load_policy->path = strdup(path);
+ 	} else {
+-		conf->load_policy->path = strdup("/usr/sbin/load_policy");
++		snprintf(path, sizeof(path), "/usr/sbin/%sload_policy", prog_prefix);
++		conf->load_policy->path = strdup(path);
+ 	}
+ 	if (conf->load_policy->path == NULL) {
+ 		return -1;
+@@ -388,10 +404,12 @@ static int semanage_conf_init(semanage_conf_t * conf)
+ 	     calloc(1, sizeof(*(current_conf->setfiles)))) == NULL) {
+ 		return -1;
+ 	}
+-	if (access("/sbin/setfiles", X_OK) == 0) {
+-		conf->setfiles->path = strdup("/sbin/setfiles");
++	snprintf(path, sizeof(path), "/sbin/%ssetfiles", prog_prefix);
++	if (access(path, X_OK) == 0) {
++		conf->setfiles->path = strdup(path);
+ 	} else {
+-		conf->setfiles->path = strdup("/usr/sbin/setfiles");
++		snprintf(path, sizeof(path), "/usr/sbin/%ssetfiles", prog_prefix);
++		conf->setfiles->path = strdup(path);
+ 	}
+ 	if ((conf->setfiles->path == NULL) ||
+ 	    (conf->setfiles->args = strdup("-q -c $@ $<")) == NULL) {
+@@ -402,10 +420,12 @@ static int semanage_conf_init(semanage_conf_t * conf)
+ 	     calloc(1, sizeof(*(current_conf->sefcontext_compile)))) == NULL) {
+ 		return -1;
+ 	}
+-	if (access("/sbin/sefcontext_compile", X_OK) == 0) {
+-		conf->sefcontext_compile->path = strdup("/sbin/sefcontext_compile");
++	snprintf(path, sizeof(path), "/sbin/%ssefcontext_compile", prog_prefix);
++	if (access(path, X_OK) == 0) {
++		conf->sefcontext_compile->path = strdup(path);
+ 	} else {
+-		conf->sefcontext_compile->path = strdup("/usr/sbin/sefcontext_compile");
++		snprintf(path, sizeof(path), "/usr/sbin/%ssefcontext_compile", prog_prefix);
++		conf->sefcontext_compile->path = strdup(path);
+ 	}
+ 	if ((conf->sefcontext_compile->path == NULL) ||
+ 	    (conf->sefcontext_compile->args = strdup("$@")) == NULL) {
+@@ -421,8 +441,9 @@ static int semanage_conf_init(semanage_conf_t * conf)
+  * default values.  If the file could not be parsed correctly or if
+  * out of memory return NULL.
+  */
+-semanage_conf_t *semanage_conf_parse(const char *config_filename)
++semanage_conf_t *semanage_conf_parse(semanage_handle_t *handle, const char *config_filename)
+ {
++	current_handle = handle;
+ 	if ((current_conf = calloc(1, sizeof(*current_conf))) == NULL) {
+ 		return NULL;
+ 	}
+@@ -506,7 +527,7 @@ static int parse_module_store(char *arg)
+ 	if (strcmp(arg, "direct") == 0) {
+ 		current_conf->store_type = SEMANAGE_CON_DIRECT;
+ 		current_conf->store_path =
+-		    strdup(basename(selinux_policy_root()));
++		    strdup(basename(semanage_compat_security_policy_root(current_handle)));
+ 		current_conf->server_port = -1;
+ 	} else if (*arg == '/') {
+ 		current_conf->store_type = SEMANAGE_CON_POLSERV_LOCAL;
+diff --git a/src/direct_api.c b/src/direct_api.c
+index 0f61788..466239e 100644
+--- a/src/direct_api.c
++++ b/src/direct_api.c
+@@ -22,7 +22,6 @@
+ #include <sepol/module.h>
+ #include <sepol/handle.h>
+ #include <sepol/cil/cil.h>
+-#include <selinux/selinux.h>
+ 
+ #include <assert.h>
+ #include <fcntl.h>
+@@ -59,6 +58,7 @@
+ #include "database_policydb.h"
+ #include "policy.h"
+ #include "sha256.h"
++#include "security_compat.h"
+ 
+ #define PIPE_READ 0
+ #define PIPE_WRITE 1
+@@ -698,7 +698,7 @@ static int semanage_direct_update_user_extra(semanage_handle_t * sh, cil_db_t *c
+ 		/*
+ 		 * Write the users_extra file; users_extra.local
+ 		 * will be merged into this file.
+-		 */
++	 	*/
+ 		ofilename = semanage_path(SEMANAGE_TMP, SEMANAGE_USERS_EXTRA);
+ 		if (ofilename == NULL) {
+ 			retval = -1;
+@@ -1768,7 +1768,7 @@ static int semanage_direct_commit(semanage_handle_t * sh)
+ 		}
+ 	} else {
+ 		WARN(sh, "WARNING: genhomedircon is disabled. \
+-                               See /etc/selinux/semanage.conf if you need to enable it.");
++                               See semanage.conf if you need to enable it.");
+         }
+ 
+ 	/* free out, if we don't free it before calling semanage_install_sandbox 
+@@ -1944,7 +1944,7 @@ static int semanage_direct_install_file(semanage_handle_t * sh,
+ 			goto cleanup;
+ 		}
+ 	} else if (strcmp(module_name, filename) != 0) {
+-		fprintf(stderr, "Warning: SELinux userspace will refer to the module from %s as %s rather than %s\n", install_filename, module_name, filename);
++		fprintf(stderr, "Warning: security userspace will refer to the module from %s as %s rather than %s\n", install_filename, module_name, filename);
+ 	}
+ 
+ 	retval = semanage_direct_install(sh, contents.data, contents.len,
+@@ -2478,7 +2478,11 @@ check_lang_ext:
+ 	/* set module ext */
+ 	if (getline(&tmp, &size, fp) < 0) {
+ 		if (!check_flag && check_and_restore_module_flag) {
+-			snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modkey->name);
++			if (semanage_compat_get_backend(sh) == SEMANAGE_SECURITY_BACKEND_USEC) {
++				snprintf(pp_path, sizeof(pp_path), "/usr/share/usec/%s/%s.pp.bz2", sh->conf->store_path, modkey->name);
++			} else {
++				snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modkey->name);
++			}
+ 			if (access(pp_path, F_OK) == 0) {
+ 				fclose(fp);
+ 				fp = NULL;
+@@ -3516,7 +3520,11 @@ int semanage_direct_check_and_restore_all_modules(semanage_handle_t *sh)
+ 						(&modinfo),
+ 					&modinfo_tmp);
+ 			if (ret != 0) {
+-				snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modules[j]->d_name);
++				if (semanage_compat_get_backend(sh) == SEMANAGE_SECURITY_BACKEND_USEC) {
++					snprintf(pp_path, sizeof(pp_path), "/usr/share/usec/%s/%s.pp.bz2", sh->conf->store_path, modules[j]->d_name);
++				} else {
++					snprintf(pp_path, sizeof(pp_path), "/usr/share/selinux/%s/%s.pp.bz2", sh->conf->store_path, modules[j]->d_name);
++				}
+ 				if (access(pp_path, F_OK) == 0)
+ 					semanage_direct_restore_module(sh, priority, pp_path);
+ 			}
+@@ -3553,9 +3561,15 @@ cleanup:
+ 
+ int semanage_direct_set_restore_module_flag(semanage_handle_t *sh, int enabled)
+  {
+-	/* Only security privileged processes(who is allowed to write selinux config file) can enable this flag */
++	/* Only security privileged processes(who is allowed to write selinux/usec config file) can enable this flag */
+ 	if (enabled) {
+-		int fd = open("/etc/selinux/config", O_WRONLY);
++		const char *config_path;
++		if (semanage_compat_get_backend(sh) == SEMANAGE_SECURITY_BACKEND_USEC) {
++			config_path = "/etc/usec/config";
++		} else {
++			config_path = "/etc/selinux/config";
++		}
++		int fd = open(config_path, O_WRONLY);
+ 		if (fd < 0)
+ 			return -1;
+ 		close(fd);
+@@ -3564,4 +3578,3 @@ int semanage_direct_set_restore_module_flag(semanage_handle_t *sh, int enabled)
+ 	return 0;
+  }
+ 
+-
+diff --git a/src/handle.c b/src/handle.c
+index c1be279..eff3650 100644
+--- a/src/handle.c
++++ b/src/handle.c
+@@ -21,8 +21,6 @@
+ 
+ /* This file implements only the publicly-visible handle functions to libsemanage. */
+ 
+-#include <selinux/selinux.h>
+-
+ #include <ctype.h>
+ #include <stdarg.h>
+ #include <assert.h>
+@@ -34,6 +32,7 @@
+ #include "direct_api.h"
+ #include "handle.h"
+ #include "debug.h"
++#include "security_compat.h"
+ #include "semanage_conf.h"
+ #include "semanage_store.h"
+ 
+@@ -58,7 +57,7 @@ const char * semanage_root(void)
+ }
+ 
+ 
+-semanage_handle_t *semanage_handle_create(void)
++static semanage_handle_t *semanage_handle_create_common(enum semanage_security_backend backend)
+ {
+ 	semanage_handle_t *sh = NULL;
+ 	char *conf_name = NULL;
+@@ -67,10 +66,13 @@ semanage_handle_t *semanage_handle_create(void)
+ 	if ((sh = calloc(1, sizeof(semanage_handle_t))) == NULL)
+ 		goto err;
+ 
+-	if ((conf_name = semanage_conf_path()) == NULL)
++	if (semanage_compat_set_backend(sh, backend) < 0)
++		goto err;
++
++	if ((conf_name = semanage_conf_path(sh)) == NULL)
+ 		goto err;
+ 
+-	if ((sh->conf = semanage_conf_parse(conf_name)) == NULL)
++	if ((sh->conf = semanage_conf_parse(sh, conf_name)) == NULL)
+ 		goto err;
+ 
+ 	/* Link to sepol handle */
+@@ -92,7 +94,7 @@ semanage_handle_t *semanage_handle_create(void)
+ 	 * if only selinux2 is enabled, selinux_mnt is not NULL but is_selinux_enabled
+ 	 * will return 0, so use security_getenforce() here is the best way.
+ 	*/
+-	sh->do_reload = (security_getenforce() >= 0);
++	sh->do_reload = (semanage_compat_security_getenforce(sh) >= 0);
+ 
+ 	/* By default always check the file contexts file. */
+ 	sh->do_check_contexts = 1;
+@@ -117,6 +119,16 @@ semanage_handle_t *semanage_handle_create(void)
+ 	return NULL;
+ }
+ 
++semanage_handle_t *semanage_handle_create(void)
++{
++	return semanage_handle_create_common(SEMANAGE_SECURITY_BACKEND_SELINUX);
++}
++
++semanage_handle_t *semanage_handle_create_with_security_backend(enum semanage_security_backend backend)
++{
++	return semanage_handle_create_common(backend);
++}
++
+ void semanage_set_rebuild(semanage_handle_t * sh, int do_rebuild)
+ {
+ 	assert(sh != NULL);
+diff --git a/src/handle.h b/src/handle.h
+index c7f4e90..6317d83 100644
+--- a/src/handle.h
++++ b/src/handle.h
+@@ -55,6 +55,7 @@ struct semanage_handle {
+ 	sepol_handle_t *sepolh;
+ 
+ 	semanage_conf_t *conf;
++	enum semanage_security_backend security_backend;
+ 
+ 	uint16_t priority;
+ 	int is_connected;
+diff --git a/src/libsemanage.map b/src/libsemanage.map
+index c8214b2..308193e 100644
+--- a/src/libsemanage.map
++++ b/src/libsemanage.map
+@@ -349,4 +349,5 @@ LIBSEMANAGE_1.1 {
+ LIBSEMANAGE_3.4 {
+     semanage_module_compute_checksum;
+     semanage_set_check_ext_changes;
++    semanage_handle_create_with_security_backend;
+ } LIBSEMANAGE_1.1;
+diff --git a/src/security_compat.c b/src/security_compat.c
+new file mode 100644
+index 0000000..2cac1fb
+--- /dev/null
++++ b/src/security_compat.c
+@@ -0,0 +1,212 @@
++/* Compatibility layer for SELinux vs USEC backends. */
++
++#include "security_compat.h"
++#include "handle.h"
++#include "debug.h"
++
++#include <errno.h>
++
++static enum semanage_security_backend semanage_default_backend =
++	SEMANAGE_SECURITY_BACKEND_SELINUX;
++
++static int semanage_compat_backend_supported(enum semanage_security_backend backend)
++{
++	switch (backend) {
++	case SEMANAGE_SECURITY_BACKEND_SELINUX:
++		return 1;
++	case SEMANAGE_SECURITY_BACKEND_USEC:
++#ifdef HAVE_USEC
++		/* USEC is supported if linked at compile time */
++		return 1;
++#else
++		return 0;
++#endif
++	default:
++		return 0;
++	}
++}
++
++enum semanage_security_backend semanage_compat_get_backend(const semanage_handle_t *sh)
++{
++	if (sh)
++		return sh->security_backend;
++	return semanage_default_backend;
++}
++
++int semanage_compat_set_backend(semanage_handle_t *sh, enum semanage_security_backend backend)
++{
++	if (!semanage_compat_backend_supported(backend)) {
++		ERR(sh, "Unsupported security backend: %d", backend);
++		errno = ENOTSUP;
++		return -1;
++	}
++
++	if (sh) {
++		sh->security_backend = backend;
++	}
++	
++	semanage_default_backend = backend;
++
++	return 0;
++}
++
++#ifdef HAVE_USEC
++static int semanage_compat_use_usec(const semanage_handle_t *sh)
++{
++	return semanage_compat_get_backend(sh) == SEMANAGE_SECURITY_BACKEND_USEC;
++}
++#endif
++
++const char *semanage_compat_security_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_path(); // /etc/selinux
++}
++
++const char *semanage_compat_security_policy_root(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_policy_root();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_policy_root();// /etc/selinux/default
++}
++
++const char *semanage_compat_security_file_context_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_file_context_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_file_context_path();
++}
++
++const char *semanage_compat_security_file_context_homedir_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_file_context_homedir_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_file_context_homedir_path();
++}
++
++const char *semanage_compat_security_file_context_local_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_file_context_local_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_file_context_local_path();
++}
++
++const char *semanage_compat_security_netfilter_context_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_netfilter_context_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_netfilter_context_path();
++}
++
++const char *semanage_compat_security_usersconf_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_usersconf_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_usersconf_path();
++}
++
++const char *semanage_compat_security_binary_policy_path(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_binary_policy_path();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_binary_policy_path();
++}
++
++int semanage_compat_security_set_policy_root(semanage_handle_t *sh, const char *path)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_set_policy_root(path);
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_set_policy_root(path);
++}
++
++char *semanage_compat_security_boolean_sub(semanage_handle_t *sh, const char *name)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_boolean_sub(name);
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return selinux_boolean_sub(name);
++}
++
++int semanage_compat_security_getenforce(semanage_handle_t *sh)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_security_getenforce();
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return security_getenforce();
++}
++
++int semanage_compat_security_get_boolean_names(semanage_handle_t *sh, char ***names, int *len)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_security_get_boolean_names(names, len);
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return security_get_boolean_names(names, len);
++}
++
++int semanage_compat_security_get_boolean_active(semanage_handle_t *sh, const char *name)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_security_get_boolean_active(name);
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return security_get_boolean_active(name);
++}
++
++int semanage_compat_security_set_boolean_list(semanage_handle_t *sh, int count, void *boollist, int permanent)
++{
++#ifdef HAVE_USEC
++	if (semanage_compat_use_usec(sh))
++		return usec_security_set_boolean_list(count, (usec_boolean_t *)boollist, permanent);
++#else
++	(void)sh;  /* Suppress unused parameter warning when USEC is not enabled */
++#endif
++	return security_set_boolean_list(count, (SELboolean *)boollist, permanent);
++}
+diff --git a/src/security_compat.h b/src/security_compat.h
+new file mode 100644
+index 0000000..d65a707
+--- /dev/null
++++ b/src/security_compat.h
+@@ -0,0 +1,36 @@
++/* Compatibility layer for SELinux vs USEC backends.
++ *
++ * This keeps libsemanage from directly calling libselinux symbols and
++ * allows runtime selection of the security backend.
++ */
++
++#ifndef SEMANAGE_SECURITY_COMPAT_H
++#define SEMANAGE_SECURITY_COMPAT_H
++
++#include <semanage/handle.h>
++#include <selinux/selinux.h>
++#ifdef HAVE_USEC
++#include <usec/usec.h>
++#endif
++
++enum semanage_security_backend semanage_compat_get_backend(const semanage_handle_t *sh);
++int semanage_compat_set_backend(semanage_handle_t *sh, enum semanage_security_backend backend);
++
++const char *semanage_compat_security_path(semanage_handle_t *sh);
++const char *semanage_compat_security_policy_root(semanage_handle_t *sh);
++const char *semanage_compat_security_file_context_path(semanage_handle_t *sh);
++const char *semanage_compat_security_file_context_homedir_path(semanage_handle_t *sh);
++const char *semanage_compat_security_file_context_local_path(semanage_handle_t *sh);
++const char *semanage_compat_security_netfilter_context_path(semanage_handle_t *sh);
++const char *semanage_compat_security_usersconf_path(semanage_handle_t *sh);
++const char *semanage_compat_security_binary_policy_path(semanage_handle_t *sh);
++
++int semanage_compat_security_set_policy_root(semanage_handle_t *sh, const char *path);
++char *semanage_compat_security_boolean_sub(semanage_handle_t *sh, const char *name);
++
++int semanage_compat_security_getenforce(semanage_handle_t *sh);
++int semanage_compat_security_get_boolean_names(semanage_handle_t *sh, char ***names, int *len);
++int semanage_compat_security_get_boolean_active(semanage_handle_t *sh, const char *name);
++int semanage_compat_security_set_boolean_list(semanage_handle_t *sh, int count, void *boollist, int permanent);
++
++#endif
+diff --git a/src/semanage-usec.conf b/src/semanage-usec.conf
+new file mode 100644
+index 0000000..134ce51
+--- /dev/null
++++ b/src/semanage-usec.conf
+@@ -0,0 +1,46 @@
++# Authors: Jason Tang <jtang@tresys.com>
++#
++# Copyright (C) 2004-2005 Tresys Technology, LLC
++#
++#  This library is free software; you can redistribute it and/or
++#  modify it under the terms of the GNU Lesser General Public
++#  License as published by the Free Software Foundation; either
++#  version 2.1 of the License, or (at your option) any later version.
++#
++#  This library is distributed in the hope that it will be useful,
++#  but WITHOUT ANY WARRANTY; without even the implied warranty of
++#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++#  Lesser General Public License for more details.
++#
++#  You should have received a copy of the GNU Lesser General Public
++#  License along with this library; if not, write to the Free Software
++#  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++#
++# Specify how libsemanage will interact with a SELinux policy manager.
++# The four options are:
++#
++#  "source"     - libsemanage manipulates a source SELinux policy
++#  "direct"     - libsemanage will write directly to a module store.
++#  /foo/bar     - Write by way of a policy management server, whose
++#                 named socket is at /foo/bar.  The path must begin
++#                 with a '/'.
++#  example.com:4242
++#               - Establish a TCP connection to a remote policy
++#                 management server at example.com.  If there is a colon
++#                 then the remainder is interpreted as a port number;
++#                 otherwise default to port 4242.
++module-store = direct
++
++# When generating the final linked and expanded policy, by default
++# semanage will set the policy version to POLICYDB_VERSION_MAX, as
++# given in <sepol/policydb.h>.  Change this setting if a different
++# version is necessary.
++#policy-version = 19
++
++# expand-check check neverallow rules when executing all semanage commands.
++# Large penalty in time if you turn this on.
++expand-check=0
++
++# By default, semanage will generate policies for the SELinux target.
++# To build policies for Xen, uncomment the following line.
++#target-platform = xen
+diff --git a/src/semanage_conf.h b/src/semanage_conf.h
+index 23c4b8b..6418aa9 100644
+--- a/src/semanage_conf.h
++++ b/src/semanage_conf.h
+@@ -65,7 +65,7 @@ typedef struct external_prog {
+ 	struct external_prog *next;
+ } external_prog_t;
+ 
+-semanage_conf_t *semanage_conf_parse(const char *config_filename);
++semanage_conf_t *semanage_conf_parse(semanage_handle_t *handle, const char *config_filename);
+ void semanage_conf_destroy(semanage_conf_t * conf);
+ 
+ #endif
+diff --git a/src/semanage_store.c b/src/semanage_store.c
+index 27c5d34..76bcd2c 100644
+--- a/src/semanage_store.c
++++ b/src/semanage_store.c
+@@ -36,7 +36,6 @@ typedef struct dbase_policydb dbase_t;
+ #include "database_policydb.h"
+ #include "handle.h"
+ 
+-#include <selinux/selinux.h>
+ #include <sepol/policydb.h>
+ #include <sepol/module.h>
+ 
+@@ -60,6 +59,7 @@ typedef struct dbase_policydb dbase_t;
+ #include "debug.h"
+ #include "utilities.h"
+ #include "compressed_file.h"
++#include "security_compat.h"
+ 
+ #define SEMANAGE_CONF_FILE "semanage.conf"
+ /* relative path names to enum semanage_paths to special files and
+@@ -77,6 +77,8 @@ enum semanage_file_defs {
+ static char *semanage_paths[SEMANAGE_NUM_STORES][SEMANAGE_STORE_NUM_PATHS];
+ static char *semanage_files[SEMANAGE_NUM_FILES] = { NULL };
+ static int semanage_paths_initialized = 0;
++static enum semanage_security_backend semanage_paths_backend =
++	SEMANAGE_SECURITY_BACKEND_SELINUX;
+ 
+ /* These are paths relative to the bottom of the module store */
+ static const char *semanage_relative_files[SEMANAGE_NUM_FILES] = {
+@@ -247,9 +249,9 @@ static int semanage_init_final(semanage_handle_t *sh, const char *prefix)
+ 		store_path);
+ 
+ 	/* SEMANAGE_FINAL_SELINUX */
+-	const char *selinux_root = selinux_path();
++	const char *security_root = semanage_compat_security_path(sh);
+ 	len = strlen(semanage_root()) +
+-	      strlen(selinux_root) +
++	      strlen(security_root) +
+ 	      strlen(semanage_final_prefix[SEMANAGE_FINAL_SELINUX]) +
+ 	      store_len;
+ 	semanage_final[SEMANAGE_FINAL_SELINUX] = malloc(len + 1);
+@@ -261,7 +263,7 @@ static int semanage_init_final(semanage_handle_t *sh, const char *prefix)
+ 	sprintf(semanage_final[SEMANAGE_FINAL_SELINUX],
+ 		"%s%s%s%s",
+ 		semanage_root(),
+-		selinux_root,
++		security_root,
+ 		semanage_final_prefix[SEMANAGE_FINAL_SELINUX],
+ 		store_path);
+ 
+@@ -282,7 +284,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	int ret = 0;
+ 	int status = 0;
+ 	char path[PATH_MAX];
+-	size_t offset = strlen(selinux_policy_root());
++	size_t offset = strlen(semanage_compat_security_policy_root(sh));
+ 
+ 	semanage_final_suffix[SEMANAGE_FINAL_TOPLEVEL] = strdup("");
+ 	if (semanage_final_suffix[SEMANAGE_FINAL_TOPLEVEL] == NULL) {
+@@ -292,7 +294,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	}
+ 
+ 	semanage_final_suffix[SEMANAGE_FC] =
+-		strdup(selinux_file_context_path() + offset);
++		strdup(semanage_compat_security_file_context_path(sh) + offset);
+ 	if (semanage_final_suffix[SEMANAGE_FC] == NULL) {
+ 		ERR(sh, "Unable to allocate space for file context path.");
+ 		status = -1;
+@@ -307,7 +309,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	}
+ 
+ 	semanage_final_suffix[SEMANAGE_FC_HOMEDIRS] =
+-		strdup(selinux_file_context_homedir_path() + offset);
++		strdup(semanage_compat_security_file_context_homedir_path(sh) + offset);
+ 	if (semanage_final_suffix[SEMANAGE_FC_HOMEDIRS] == NULL) {
+ 		ERR(sh, "Unable to allocate space for file context home directory path.");
+ 		status = -1;
+@@ -322,7 +324,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	}
+ 
+ 	semanage_final_suffix[SEMANAGE_FC_LOCAL] =
+-		strdup(selinux_file_context_local_path() + offset);
++		strdup(semanage_compat_security_file_context_local_path(sh) + offset);
+ 	if (semanage_final_suffix[SEMANAGE_FC_LOCAL] == NULL) {
+ 		ERR(sh, "Unable to allocate space for local file context path.");
+ 		status = -1;
+@@ -337,7 +339,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	}
+ 
+ 	semanage_final_suffix[SEMANAGE_NC] =
+-		strdup(selinux_netfilter_context_path() + offset);
++		strdup(semanage_compat_security_netfilter_context_path(sh) + offset);
+ 	if (semanage_final_suffix[SEMANAGE_NC] == NULL) {
+ 		ERR(sh, "Unable to allocate space for netfilter context path.");
+ 		status = -1;
+@@ -345,7 +347,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	}
+ 
+ 	semanage_final_suffix[SEMANAGE_SEUSERS] =
+-		strdup(selinux_usersconf_path() + offset);
++		strdup(semanage_compat_security_usersconf_path(sh) + offset);
+ 	if (semanage_final_suffix[SEMANAGE_SEUSERS] == NULL) {
+ 		ERR(sh, "Unable to allocate space for userconf path.");
+ 		status = -1;
+@@ -355,7 +357,7 @@ static int semanage_init_final_suffix(semanage_handle_t *sh)
+ 	ret = snprintf(path,
+ 		       sizeof(path),
+ 		       "%s.%d",
+-		       selinux_binary_policy_path() + offset,
++		       semanage_compat_security_binary_policy_path(sh) + offset,
+ 		       sh->conf->policyvers);
+ 	if (ret < 0 || ret >= (int)sizeof(path)) {
+ 		ERR(sh, "Unable to compose policy binary path.");
+@@ -432,8 +434,10 @@ cleanup:
+ int semanage_check_init(semanage_handle_t *sh, const char *prefix)
+ {
+ 	int rc;
++	enum semanage_security_backend backend = semanage_compat_get_backend(sh);
+ 	if (semanage_paths_initialized == 0) {
+ 		char root[PATH_MAX];
++		semanage_paths_backend = backend;
+ 
+ 		rc = snprintf(root,
+ 			      sizeof(root),
+@@ -466,6 +470,10 @@ int semanage_check_init(semanage_handle_t *sh, const char *prefix)
+ 
+ 		semanage_paths_initialized = 1;
+ 	}
++	if (semanage_paths_backend != backend) {
++		ERR(sh, "semanage store paths initialized for different security backend");
++		return -1;
++	}
+ 	return 0;
+ }
+ 
+@@ -512,21 +520,25 @@ const char *semanage_final_path(enum semanage_final_defs store,
+  *
+  * The caller is responsible for freeing the returned string.
+  */
+-char *semanage_conf_path(void)
++char *semanage_conf_path(semanage_handle_t *sh)
+ {
+ 	char *semanage_conf = NULL;
+ 	int len;
+ 	struct stat sb;
+ 
+-	len = strlen(semanage_root()) + strlen(selinux_path()) + strlen(SEMANAGE_CONF_FILE);
++	len = strlen(semanage_root()) +
++	      strlen(semanage_compat_security_path(sh)) +
++	      strlen(SEMANAGE_CONF_FILE);
+ 	semanage_conf = calloc(len + 1, sizeof(char));
+ 	if (!semanage_conf)
+ 		return NULL;
+-	snprintf(semanage_conf, len + 1, "%s%s%s", semanage_root(), selinux_path(),
++	snprintf(semanage_conf, len + 1, "%s%s%s", semanage_root(),
++		 semanage_compat_security_path(sh),
+ 		 SEMANAGE_CONF_FILE);
+ 
+ 	if (stat(semanage_conf, &sb) != 0 && errno == ENOENT) {
+-		snprintf(semanage_conf, len + 1, "%s%s", selinux_path(), SEMANAGE_CONF_FILE);
++		snprintf(semanage_conf, len + 1, "%s%s",
++			 semanage_compat_security_path(sh), SEMANAGE_CONF_FILE);
+ 	}
+ 
+ 	return semanage_conf;
+@@ -1683,7 +1695,7 @@ static int semanage_install_final_tmp(semanage_handle_t * sh)
+ 	 * and what we are installing to, to decide if they are the same store. If
+ 	 * they are not then we do not reload policy.
+ 	 */
+-	const char *really_active_store = selinux_policy_root();
++	const char *really_active_store = semanage_compat_security_policy_root(sh);
+ 	struct stat astore;
+ 	struct stat istore;
+ 	const char *storepath = semanage_final_path(SEMANAGE_FINAL_SELINUX,
+diff --git a/src/semanage_store.h b/src/semanage_store.h
+index 1fc77da..10de913 100644
+--- a/src/semanage_store.h
++++ b/src/semanage_store.h
+@@ -92,7 +92,7 @@ enum semanage_final_path_defs {
+ /* FIXME: this needs to be made a module store specific init and the
+  * global configuration moved to another file.
+  */
+-char *semanage_conf_path(void);
++char *semanage_conf_path(semanage_handle_t *sh);
+ 
+ int semanage_check_init(semanage_handle_t *sh, const char *prefix);
+ 
+diff --git a/src/semanageswig_python.i b/src/semanageswig_python.i
+index 5f01139..ad32f3d 100644
+--- a/src/semanageswig_python.i
++++ b/src/semanageswig_python.i
+@@ -111,7 +111,7 @@
+ }
+ 
+ %typemap(argout) char** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_FromCharPtr(*$1));
++	$result = SWIG_AppendOutput($result, SWIG_FromCharPtr(*$1));
+ 	free(*$1);
+ }
+ 
+@@ -134,7 +134,7 @@
+                         	NULL, NULL, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -148,7 +148,7 @@
+ }
+ 
+ %typemap(argout) semanage_module_info_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ /** module key typemaps **/
+@@ -160,7 +160,7 @@
+ }
+ 
+ %typemap(argout) semanage_module_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ /** context typemaps **/
+@@ -172,7 +172,7 @@
+ }
+ 
+ %typemap(argout) semanage_context_t** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ /** boolean typemaps **/
+@@ -197,7 +197,7 @@
+ 				(void (*) (void*)) &semanage_bool_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-		   	        $result = SWIG_Python_AppendOutput($result, plist);
++		   	        $result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -207,11 +207,11 @@
+ }
+ 
+ %typemap(argout) semanage_bool_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_bool_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_bool_key_t **(semanage_bool_key_t *temp=NULL) {
+@@ -240,7 +240,7 @@
+ 				(void (*) (void*)) &semanage_fcontext_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -250,11 +250,11 @@
+ }
+ 
+ %typemap(argout) semanage_fcontext_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_fcontext_key_t ** {
+-        $result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_fcontext_key_t **(semanage_fcontext_key_t *temp=NULL) {
+@@ -284,7 +284,7 @@
+ 				(void (*) (void*)) &semanage_iface_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -294,11 +294,11 @@
+ }
+ 
+ %typemap(argout) semanage_iface_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_iface_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_iface_key_t **(semanage_iface_key_t *temp=NULL) {
+@@ -328,7 +328,7 @@
+ 				(void (*) (void*)) &semanage_seuser_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -338,11 +338,11 @@
+ }
+ 
+ %typemap(argout) semanage_seuser_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_seuser_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_seuser_key_t **(semanage_seuser_key_t *temp=NULL) {
+@@ -371,7 +371,7 @@
+ 				(void (*) (void*)) &semanage_user_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -381,11 +381,11 @@
+ }
+ 
+ %typemap(argout) semanage_user_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_user_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_user_key_t **(semanage_user_key_t *temp=NULL) {
+@@ -414,7 +414,7 @@
+ 				(void (*) (void*)) &semanage_port_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -424,11 +424,11 @@
+ }
+ 
+ %typemap(argout) semanage_port_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_port_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_port_key_t **(semanage_port_key_t *temp=NULL) {
+@@ -457,7 +457,7 @@
+ 				(void (*) (void*)) &semanage_ibpkey_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -467,11 +467,11 @@
+ }
+ 
+ %typemap(argout) semanage_ibpkey_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_ibpkey_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_ibpkey_key_t **(semanage_ibpkey_key_t *temp=NULL) {
+@@ -500,7 +500,7 @@
+ 				(void (*) (void*)) &semanage_ibendport_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -510,11 +510,11 @@
+ }
+ 
+ %typemap(argout) semanage_ibendport_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_ibendport_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_ibendport_key_t **(semanage_ibendport_key_t *temp=NULL) {
+@@ -543,7 +543,7 @@
+ 				(void (*) (void*)) &semanage_node_free, &plist) < 0)
+ 				$result = SWIG_From_int(STATUS_ERR);
+ 			else
+-				$result = SWIG_Python_AppendOutput($result, plist);
++				$result = SWIG_AppendOutput($result, plist);
+ 		}
+ 	}
+ }
+@@ -553,12 +553,12 @@
+ }
+ 
+ %typemap(argout) semanage_node_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ 
+ %typemap(argout) semanage_node_key_t ** {
+-	$result = SWIG_Python_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++	$result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_node_key_t **(semanage_node_key_t *temp=NULL) {
+diff --git a/src/semanageswig_ruby.i b/src/semanageswig_ruby.i
+index e030e4a..9010b54 100644
+--- a/src/semanageswig_ruby.i
++++ b/src/semanageswig_ruby.i
+@@ -38,7 +38,7 @@
+ }
+ 
+ %typemap(argout) semanage_module_info_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ /** context typemaps **/
+@@ -50,7 +50,7 @@
+ }
+ 
+ %typemap(argout) semanage_context_t** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ /** boolean typemaps **/
+@@ -66,11 +66,11 @@
+ }
+ 
+ %typemap(argout) semanage_bool_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_bool_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_bool_key_t **(semanage_bool_key_t *temp=NULL) {
+@@ -90,11 +90,11 @@
+ }
+ 
+ %typemap(argout) semanage_fcontext_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_fcontext_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_fcontext_key_t **(semanage_fcontext_key_t *temp=NULL) {
+@@ -114,11 +114,11 @@
+ }
+ 
+ %typemap(argout) semanage_iface_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_iface_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_iface_key_t **(semanage_iface_key_t *temp=NULL) {
+@@ -138,11 +138,11 @@
+ }
+ 
+ %typemap(argout) semanage_seuser_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_seuser_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_seuser_key_t **(semanage_seuser_key_t *temp=NULL) {
+@@ -162,11 +162,11 @@
+ }
+ 
+ %typemap(argout) semanage_user_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_user_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_user_key_t **(semanage_user_key_t *temp=NULL) {
+@@ -186,11 +186,11 @@
+ }
+ 
+ %typemap(argout) semanage_port_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(argout) semanage_port_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_port_key_t **(semanage_port_key_t *temp=NULL) {
+@@ -210,12 +210,12 @@
+ }
+ 
+ %typemap(argout) semanage_node_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ 
+ %typemap(argout) semanage_node_key_t ** {
+-        $result = SWIG_Ruby_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
++        $result = SWIG_AppendOutput($result, SWIG_NewPointerObj(*$1, $*1_descriptor, 0));
+ }
+ 
+ %typemap(in, numinputs=0) semanage_node_key_t **(semanage_node_key_t *temp=NULL) {
+diff --git a/src/seuser_record.c b/src/seuser_record.c
+index 44a5475..38150dc 100644
+--- a/src/seuser_record.c
++++ b/src/seuser_record.c
+@@ -129,7 +129,7 @@ int semanage_seuser_set_name(semanage_handle_t * handle,
+ }
+ 
+ 
+-/* Selinux Name */
++/* Security Name */
+ const char *semanage_seuser_get_sename(const semanage_seuser_t * seuser)
+ {
+ 
+@@ -144,7 +144,7 @@ int semanage_seuser_set_sename(semanage_handle_t * handle,
+ 	char *tmp_sename = strdup(sename);
+ 	if (!tmp_sename) {
+ 		ERR(handle,
+-		    "out of memory, could not set seuser (SELinux) name");
++		    "out of memory, could not set seuser security  name");
+ 		return STATUS_ERR;
+ 	}
+ 	free(seuser->sename);
+diff --git a/src/seusers_local.c b/src/seusers_local.c
+index 6508ec0..886c5ee 100644
+--- a/src/seusers_local.c
++++ b/src/seusers_local.c
+@@ -256,18 +256,18 @@ static int validate_handler(const semanage_seuser_t * seuser, void *varg)
+ 	const char *mls_range = semanage_seuser_get_mlsrange(seuser);
+ 	const char *user_mls_range;
+ 
+-	/* Make sure the (SElinux) user exists */
++	/* Make sure the (SElinux/USEC) user exists */
+ 	if (semanage_user_key_create(handle, sename, &key) < 0)
+ 		goto err;
+ 	if (semanage_user_exists(handle, key, &exists) < 0)
+ 		goto err;
+ 	if (!exists) {
+-		ERR(handle, "selinux user %s does not exist", sename);
++		ERR(handle, "selinux/usec user %s does not exist", sename);
+ 		goto invalid;
+ 	}
+ 
+ 	/* Verify that the mls range is valid, and that it's contained
+-	 * within the (SELinux) user mls range. This range is optional */
++	 * within the (SELinux/USEC) user mls range. This range is optional */
+ 	if (mls_range && sepol_policydb_mls_enabled(policydb)) {
+ 
+ 		if (semanage_user_query(handle, key, &user) < 0)
+@@ -282,7 +282,7 @@ static int validate_handler(const semanage_seuser_t * seuser, void *varg)
+ 
+ 		if (!mls_ok) {
+ 			ERR(handle, "MLS range %s for Unix user %s "
+-			    "exceeds allowed range %s for SELinux user %s",
++			    "exceeds allowed range %s for SELinux/USEC user %s",
+ 			    mls_range, name, user_mls_range, sename);
+ 			goto invalid;
+ 		}
+diff --git a/tests/Makefile b/tests/Makefile
+index d432998..a212062 100644
+--- a/tests/Makefile
++++ b/tests/Makefile
+@@ -6,8 +6,14 @@ CILS = $(sort $(wildcard *.cil))
+ 
+ EXECUTABLE = libsemanage-tests
+ CFLAGS += -g -O0 -Wall -W -Wundef -Wmissing-noreturn -Wmissing-format-attribute -Wno-unused-parameter
+-override CFLAGS += -I../src -I../include
+-override LDLIBS += -lcunit -lbz2 -laudit -lselinux -lsepol
++
++ifeq ($(USEC),1)
++	USEC_ENABLE := -DHAVE_USEC=1
++	USEC_LIBS := -lusec
++endif
++
++override CFLAGS += -I../src -I../include $(USEC_ENABLE)
++override LDLIBS += -lcunit -lbz2 -laudit -lselinux $(USEC_LIBS) -lsepol
+ 
+ OBJECTS = $(SOURCES:.c=.o)
+ POLICIES = $(CILS:.cil=.policy)
+-- 
+2.20.1
+

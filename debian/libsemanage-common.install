@@ -1,3 +1,4 @@
 etc/selinux/semanage.conf
+etc/usec/semanage.conf
 usr/share/man/man5/
 usr/share/man/ru/man5/
