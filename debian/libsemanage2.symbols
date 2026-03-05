@@ -85,6 +85,7 @@ libsemanage.so.2 libsemanage2 #MINVER#
  semanage_get_ignore_module_cache@LIBSEMANAGE_1.1 2.4
  semanage_get_preserve_tunables@LIBSEMANAGE_1.0 2.1.6
  semanage_handle_create@LIBSEMANAGE_1.0 2.0.3
+ semanage_handle_create_with_security_backend@LIBSEMANAGE_3.4 3.5-1deepin3
  semanage_handle_destroy@LIBSEMANAGE_1.0 2.0.3
  semanage_ibendport_clone@LIBSEMANAGE_1.0 2.7~rc2
  semanage_ibendport_compare2@LIBSEMANAGE_1.0 2.7~rc2
